@@ -39,7 +39,8 @@ ENTRY2_Y1, ENTRY2_Y2 = 0.80, 1.00
 EXIT_X1,  EXIT_X2  = 0.25, 0.85
 EXIT_Y1,  EXIT_Y2  = 0.25, 0.80
 
-MIN_CLIP_SECONDS   = 0.8
+MIN_CLIP_SECONDS   = 0.5    # 特征提取/救援用；短于此的接近段也能参与 Re-ID
+MIN_OUTPUT_SECONDS = 0.8    # 最终剪辑输出的最短时长（独立片段；归并组不受此限）
 MAX_GAP_SECONDS    = 3
 CONF_THRESHOLD     = 0.5
 DOMINANT_HEIGHT_RATIO = 0.18
@@ -151,10 +152,12 @@ track_start     = {}
 track_start_archive = {}   # 永久保存每个tid的首次出现帧（不会被pop）
 track_active    = {}
 track_positions = defaultdict(list)
+track_boxes     = defaultdict(dict)   # {tid: {frame_idx: (tx1,ty1,tx2,ty2)}}，用于空间IoU计算
 track_is_slow   = {}
 track_hit_entry     = set()
 track_hit_exit      = set()
 track_last_exit_frame = {}   # {tid: last frame seen inside EXIT zone}
+track_frame_exit = {}        # {tid: last frame where bbox still partially in full frame (ROI外延伸)}
 track_segments  = defaultdict(list)   # {tid: [(start,end),...]}
 track_crops     = defaultdict(list)   # {tid: [crop_img,...]} 代表帧
 clip_segments   = []                  # (start,end,tid) 用于时间轴
@@ -199,11 +202,10 @@ while True:
             cx,cy = (tx1+tx2)//2,(ty1+ty2)//2
             bw,bh = tx2-tx1,ty2-ty1
 
-            # 已建立的 track：bbox 还与画幅有任何重叠就持续延伸结束时间
-            # 完全离开画幅（bbox 不再与画幅相交）才停止
-            # （hit_streak 在 coasting 时会归零，不能用于已确认 track 的出画判断）
+            # 已建立的 track：bbox 还与画幅有任何重叠就记录出画帧（仅供剪辑结束点用）
+            # 注意：不更新 track_active，保持其只反映 ROI 内的最后出现时间（供时序间隔计算）
             if tid in track_start and tx2 > 0 and tx1 < W and ty2 > 0 and ty1 < H:
-                track_active[tid] = frame_idx
+                track_frame_exit[tid] = frame_idx
 
             # 以下是正常 ROI 内处理（检测匹配、速度、裁剪等）
             if not (roi_x1<=cx<=roi_x2 and roi_y1<=cy<=roi_y2): continue
@@ -213,6 +215,7 @@ while True:
 
             active_ids.add(tid)
             track_positions[tid].append((cx,cy))
+            track_boxes[tid][frame_idx] = (tx1, ty1, tx2, ty2)
 
             # 速度
             pts = track_positions[tid]
@@ -319,7 +322,7 @@ print("="*50)
 
 # 加载轻量Re-ID模型
 reid_model = torchreid.models.build_model(
-    name='osnet_x0_25',
+    name='osnet_ain_x1_0',
     num_classes=1000,
     pretrained=True
 )
@@ -330,10 +333,29 @@ if torch.cuda.is_available():
 else:
     print("Re-ID running on CPU")
 
+CROP_QUALITY_MIN = 0.12   # 低于此值的 crop 视为空帧/漂移框，跳过
+
+def crop_quality(crop):
+    """对比度评分：人物 crop 纹理丰富，漂移到背景的框对比度极低"""
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    mean = gray.mean()
+    std  = gray.std()
+    score = std / (mean + 1e-8)
+    # 极暗 crop（框住地面/阴影）额外降分
+    if mean < 20:
+        score *= 0.3
+    return score
+
+def filter_crops(crops):
+    """保留质量合格的 crop；若全部不合格则 fallback 到原始列表"""
+    good = [c for c in crops if c is not None and c.size > 0
+            and crop_quality(c) >= CROP_QUALITY_MIN]
+    return good if good else [c for c in crops if c is not None and c.size > 0]
+
 def extract_feature(crop_imgs):
     """从一组裁剪图提取平均特征向量"""
     feats = []
-    for crop in crop_imgs:
+    for crop in filter_crops(crop_imgs):
         if crop is None or crop.size == 0:
             continue
         img = cv2.resize(crop, (128, 256))
@@ -365,6 +387,62 @@ for tid in valid_tids:
 
 print(f"Extracted features for {len(features)} tracks")
 
+# 颜色直方图特征（上半身/外套区域 HSV）
+# 与 OSNet 特征加权拼接，增强颜色区分能力
+COLOR_WEIGHT = 0.35   # 35% 颜色，65% 外观形态
+
+def extract_color_hist(crops):
+    """提取上体（外套）+ 下体（固定器/靴子）HSV 颜色直方图，返回归一化向量"""
+    hists = []
+    for crop in crops:
+        if crop is None or crop.size == 0:
+            continue
+        h = crop.shape[0]
+
+        def zone_hist(zone):
+            if zone.size == 0:
+                return np.zeros(48)
+            hsv = cv2.cvtColor(zone, cv2.COLOR_BGR2HSV)
+            hh = cv2.calcHist([hsv], [0], None, [16], [0, 180]).flatten()
+            sh = cv2.calcHist([hsv], [1], None, [16], [0, 256]).flatten()
+            vh = cv2.calcHist([hsv], [2], None, [16], [0, 256]).flatten()
+            hist = np.concatenate([hh, sh, vh])
+            return hist / (hist.sum() + 1e-8)
+
+        upper = crop[:max(1, int(h * 0.55)), :]     # 上 55%：外套
+        lower = crop[max(0, int(h * 0.70)):, :]     # 下 30%：靴子/固定器
+        # 上体权重 0.6，下体权重 0.4
+        hist = np.concatenate([zone_hist(upper) * 0.6, zone_hist(lower) * 0.4])
+        hists.append(hist)
+    return np.mean(hists, axis=0) if hists else None
+
+color_features = []
+valid_tids_color = []
+for tid in valid_tids:
+    crops = track_crops.get(tid, [])
+    if not crops:
+        continue
+    cfeat = extract_color_hist(filter_crops(crops))
+    if cfeat is not None:
+        color_features.append(cfeat)
+        valid_tids_color.append(tid)
+
+# 构建每个 tid 的组合特征（OSNet + 颜色直方图加权拼接）
+def make_combined_feat(osnet_feat, color_feat):
+    o = osnet_feat / (np.linalg.norm(osnet_feat) + 1e-8)
+    c = color_feat  / (np.linalg.norm(color_feat)  + 1e-8)
+    return np.concatenate([(1 - COLOR_WEIGHT) * o, COLOR_WEIGHT * c])
+
+color_feat_by_tid = {t: color_features[i] for i, t in enumerate(valid_tids_color)}
+combined_feat_by_tid = {}
+for tid, osnet_f in zip(valid_tids_with_feat, features):
+    if tid in color_feat_by_tid:
+        combined_feat_by_tid[tid] = make_combined_feat(osnet_f, color_feat_by_tid[tid])
+    else:
+        combined_feat_by_tid[tid] = osnet_f / (np.linalg.norm(osnet_f) + 1e-8)
+
+print(f"Combined features (OSNet + color) built for {len(combined_feat_by_tid)} tracks")
+
 # DBSCAN 聚类
 cluster_map = {}   # {tid: cluster_id}
 main_cluster = -999
@@ -378,6 +456,50 @@ if len(features) >= 2:
 
     unique_labels = set(int(l) for l in labels)
     print(f"Clusters found: {unique_labels}")
+
+    # ── 时序约束常量（供 K-means 救援步骤和 Re-ID 归并共用）──
+    MERGE_SIM_THRESHOLD  = 0.90
+    SPLIT_GAP_SECONDS    = 1.0
+    MIN_GAP_SECONDS      = 25.0
+    IMPOSSIBLE_SIM       = 0.97
+    DOUBLE_DETECTION_SIM = 0.82
+
+    def cosine_sim(a, b):
+        a_n = a / (np.linalg.norm(a) + 1e-8)
+        b_n = b / (np.linalg.norm(b) + 1e-8)
+        return float(np.dot(a_n, b_n))
+
+    def track_gap_seconds(t1, t2):
+        segs1 = track_segments.get(t1, [])
+        segs2 = track_segments.get(t2, [])
+        if not segs1 or not segs2:
+            return float('inf')
+        end1   = max(e for _, e in segs1)
+        start1 = min(s for s, _ in segs1)
+        end2   = max(e for _, e in segs2)
+        start2 = min(s for s, _ in segs2)
+        gap_frames = max(start2 - end1, start1 - end2, 0) if not (start1 <= end2 and start2 <= end1) else -1
+        return gap_frames / fps
+
+    SPATIAL_CENTER_DIST_MAX = 0.20   # 中心距 > 20% 帧宽 → 两人同时在场
+
+    def spatial_center_dist_during_overlap(t1, t2):
+        segs1, segs2 = track_segments.get(t1, []), track_segments.get(t2, [])
+        if not segs1 or not segs2:
+            return float('inf')
+        s_start = max(min(s for s,_ in segs1), min(s for s,_ in segs2))
+        s_end   = min(max(e for _,e in segs1), max(e for _,e in segs2))
+        if s_start > s_end:
+            return float('inf')
+        boxes1, boxes2 = track_boxes.get(t1, {}), track_boxes.get(t2, {})
+        dists = []
+        for f in range(s_start, s_end + 1, 2):
+            if f in boxes1 and f in boxes2:
+                b1, b2 = boxes1[f], boxes2[f]
+                cx1 = (b1[0]+b1[2])/2;  cy1 = (b1[1]+b1[3])/2
+                cx2 = (b2[0]+b2[2])/2;  cy2 = (b2[1]+b2[3])/2
+                dists.append(((cx1-cx2)**2+(cy1-cy2)**2)**0.5 / W)
+        return float(np.mean(dists)) if dists else float('inf')
 
     # ── 最终判断：完全抛弃DBSCAN标签，对每个track单独用avg_h判断 ──
     from collections import Counter, defaultdict as _dd
@@ -403,7 +525,7 @@ if len(features) >= 2:
         crops = track_crops.get(tid, [])
         valid_crops = [c for c in crops if c is not None and c.size > 0]
         if valid_crops:
-            per_track_h[tid]    = np.mean([c.shape[0] for c in valid_crops])
+            per_track_h[tid]    = np.percentile([c.shape[0] for c in valid_crops], 75)
             per_track_dark[tid] = calc_dark_ratio_local(valid_crops)
 
     # Step2：过滤幽灵框（dark_ratio极低 = 裁剪图里没有真实人物）
@@ -437,10 +559,44 @@ if len(features) >= 2:
         threshold = 0
 
     bg_tids_set.update(ghost_tids)
+
+    # Step4：背景救援 — 对背景组里的 track 计算与主滑手组的 Re-ID 相似度，
+    # 分级阈值：
+    #   ≤ SPLIT_GAP_SECONDS 内的背景 track → 视为"接近道具阶段"被误分，用 DOUBLE_DETECTION_SIM
+    #   其余 → 用 RESCUE_SIM_THRESHOLD
+    RESCUE_SIM_THRESHOLD = 0.87
+    all_feat_by_tid = combined_feat_by_tid   # 已包含 OSNet + 颜色直方图
+    rescued = set()
+    for bg_tid in list(bg_tids_set):
+        if bg_tid not in all_feat_by_tid:
+            continue
+        best_sim, best_main = 0.0, None
+        for m_tid in main_tids_set:
+            if m_tid not in all_feat_by_tid:
+                continue
+            sim = float(np.dot(
+                all_feat_by_tid[bg_tid]  / (np.linalg.norm(all_feat_by_tid[bg_tid])  + 1e-8),
+                all_feat_by_tid[m_tid] / (np.linalg.norm(all_feat_by_tid[m_tid]) + 1e-8)))
+            if sim > best_sim:
+                best_sim, best_main = sim, m_tid
+        if best_main is None:
+            continue
+        gap = track_gap_seconds(bg_tid, best_main)
+        # 接近段（gap ≤ SPLIT_GAP）用宽松阈值；其余用标准阈值
+        # 不做空间中心距检测——跳跃动作会导致同一人 bbox 中心点大幅偏移
+        threshold = DOUBLE_DETECTION_SIM if gap <= SPLIT_GAP_SECONDS else RESCUE_SIM_THRESHOLD
+        if best_sim >= threshold:
+            rescued.add(bg_tid)
+            print(f"  [Rescue] t{bg_tid} 从背景组拉回 → 与 t{best_main} 相似度={best_sim:.3f}  gap={gap:.1f}s")
+    main_tids_set |= rescued
+    bg_tids_set   -= rescued
+    if rescued:
+        print(f"  共救援 {len(rescued)} 个 track: {sorted(rescued, key=lambda x:int(x))}")
+
     print(f"  MAIN RIDERS ({len(main_tids_set)}): {sorted(main_tids_set, key=lambda x:int(x))}")
     print(f"  BACKGROUND  ({len(bg_tids_set)}):  {sorted(bg_tids_set,  key=lambda x:int(x))}")
 
-    # Step4：用结果覆盖cluster_map（main_cluster=2保持不变作为标记）
+    # Step5：用结果覆盖cluster_map（main_cluster=2保持不变作为标记）
     main_cluster = 2
     for tid in all_tids_for_reid:
         cluster_map[tid] = main_cluster if tid in main_tids_set else 0
@@ -449,6 +605,165 @@ if len(features) >= 2:
         print("  DBSCAN found no clusters (all noise) — K-means result is used instead.")
 else:
     print("Not enough tracks for clustering, skipping.")
+
+# ─────────────────────────────────────────────
+# Re-ID 归并：把同一滑手的多个 track ID 合并
+# 条件：时间不重叠 + 余弦相似度 >= 阈值
+# ─────────────────────────────────────────────
+MERGE_SIM_THRESHOLD  = 0.90   # 正常时间间隔下的合并阈值
+SPLIT_GAP_SECONDS    = 1.0    # 间隔 ≤ 此值：追踪分割（遮挡/姿态），按宽松阈值合并
+MIN_GAP_SECONDS      = 25.0   # 间隔在 SPLIT~MIN 之间：物理上不可能是同人返回，需极高阈值
+IMPOSSIBLE_SIM       = 0.97   # "不可能返回区间"内仍允许合并的最低相似度
+DOUBLE_DETECTION_SIM = 0.82   # 时间重叠时允许合并的最低相似度（同趟误分割）
+
+def cosine_sim(a, b):
+    a_n = a / (np.linalg.norm(a) + 1e-8)
+    b_n = b / (np.linalg.norm(b) + 1e-8)
+    return float(np.dot(a_n, b_n))
+
+def track_gap_seconds(t1, t2):
+    """两个 track 之间的时间间隔（秒），重叠时为负值"""
+    segs1 = track_segments.get(t1, [])
+    segs2 = track_segments.get(t2, [])
+    if not segs1 or not segs2:
+        return float('inf')
+    end1   = max(e for _, e in segs1)
+    start1 = min(s for s, _ in segs1)
+    end2   = max(e for _, e in segs2)
+    start2 = min(s for s, _ in segs2)
+    gap_frames = max(start2 - end1, start1 - end2, 0) if not (start1 <= end2 and start2 <= end1) else -1
+    return gap_frames / fps
+
+def spatial_center_dist_during_overlap(t1, t2):
+    """计算两 track 时间重叠区间内的平均中心点距离（归一化到帧宽）。
+    距离小 → 同一人姿态变化导致的双重检测；距离大 → 两人同时在场。"""
+    segs1, segs2 = track_segments.get(t1, []), track_segments.get(t2, [])
+    if not segs1 or not segs2:
+        return float('inf')
+    s_start = max(min(s for s,_ in segs1), min(s for s,_ in segs2))
+    s_end   = min(max(e for _,e in segs1), max(e for _,e in segs2))
+    if s_start > s_end:
+        return float('inf')
+    boxes1, boxes2 = track_boxes.get(t1, {}), track_boxes.get(t2, {})
+    dists = []
+    for f in range(s_start, s_end + 1, 2):
+        if f in boxes1 and f in boxes2:
+            b1, b2 = boxes1[f], boxes2[f]
+            cx1 = (b1[0] + b1[2]) / 2;  cy1 = (b1[1] + b1[3]) / 2
+            cx2 = (b2[0] + b2[2]) / 2;  cy2 = (b2[1] + b2[3]) / 2
+            dists.append(((cx1-cx2)**2 + (cy1-cy2)**2)**0.5 / W)
+    return float(np.mean(dists)) if dists else float('inf')
+
+SPATIAL_CENTER_DIST_MAX = 0.20  # 中心距离 > 20% 帧宽 → 两人同时在场，阻止合并
+
+def can_merge(t1, t2, sim):
+    """
+    三段式时序约束（纯相似度驱动，不依赖空间位置）：
+    - 重叠或极短间隔（≤ SPLIT_GAP_SECONDS）：视为同趟误分割，按宽松阈值
+      注：不做空间中心距检测——跳跃动作会导致同一人的 bbox 位置大幅偏移
+    - 短间隔（SPLIT_GAP ~ MIN_GAP_SECONDS）：物理上不可能是同人返回，需极高阈值
+    - 长间隔（> MIN_GAP_SECONDS）：正常归来，按正常阈值
+    """
+    gap = track_gap_seconds(t1, t2)
+    if gap <= SPLIT_GAP_SECONDS:
+        return sim >= DOUBLE_DETECTION_SIM
+    elif gap < MIN_GAP_SECONDS:
+        return sim >= IMPOSSIBLE_SIM
+    else:
+        return sim >= MERGE_SIM_THRESHOLD
+
+main_feat_tids = [t for t in combined_feat_by_tid if t in main_tids_set]
+feat_by_tid    = {t: combined_feat_by_tid[t] for t in main_feat_tids}
+
+# Complete-linkage 聚类：合并两组时要求所有跨组对均 >= 阈值，避免传递性误连
+groups = [[t] for t in main_feat_tids]  # 初始每人一组
+
+def group_overlap(g1, g2):
+    for t1 in g1:
+        for t2 in g2:
+            if tracks_overlap(t1, t2):
+                return True
+    return False
+
+def group_can_merge(g1, g2, sim):
+    """complete-linkage + 双重检测豁免：所有跨组对均可合并（时间不重叠或相似度极高）"""
+    for t1 in g1:
+        for t2 in g2:
+            if not can_merge(t1, t2, sim):
+                return False
+    return True
+
+def group_min_sim(g1, g2):
+    """complete-linkage：取所有跨组对的最小相似度"""
+    return min(cosine_sim(feat_by_tid[t1], feat_by_tid[t2])
+               for t1 in g1 for t2 in g2
+               if t1 in feat_by_tid and t2 in feat_by_tid)
+
+# 诊断：打印关注配对的相似度明细（OSNet分量 vs 颜色分量）
+DEBUG_PAIRS = [
+    ('15','55'),('15','80'),('55','80'),
+    ('34','35'),('34','76'),('35','76'),
+    ('42','43'),('42','100'),('43','100'),('100','101'),
+    ('100','102'),('101','102'),
+    ('122','123'),
+]
+if any(t in feat_by_tid for pair in DEBUG_PAIRS for t in pair):
+    print("\n--- 关注配对相似度明细 ---")
+    osnet_dim = features[0].shape[0] if len(features) > 0 else 512
+    for ta, tb in DEBUG_PAIRS:
+        if ta not in feat_by_tid or tb not in feat_by_tid:
+            continue
+        fa, fb = feat_by_tid[ta], feat_by_tid[tb]
+        sim_total = cosine_sim(fa, fb)
+        # 拆分 OSNet 和颜色两段
+        fa_o, fa_c = fa[:osnet_dim], fa[osnet_dim:]
+        fb_o, fb_c = fb[:osnet_dim], fb[osnet_dim:]
+        sim_o = cosine_sim(fa_o, fb_o) if fa_o.size > 0 else 0
+        sim_c = cosine_sim(fa_c, fb_c) if fa_c.size > 0 else 0
+        gap = track_gap_seconds(ta, tb)
+        print(f"  t{ta}+t{tb}: total={sim_total:.3f}  osnet={sim_o:.3f}  color={sim_c:.3f}  gap={gap:.1f}s")
+
+print("\n--- Re-ID 归并 (complete-linkage, 阈值={}) ---".format(MERGE_SIM_THRESHOLD))
+merged_any = True
+while merged_any:
+    merged_any = False
+    best_sim, best_i, best_j = -1, -1, -1
+    for i in range(len(groups)):
+        for j in range(i + 1, len(groups)):
+            sim = group_min_sim(groups[i], groups[j])
+            # 快速过滤：低于所有场景中最宽松阈值的直接跳过
+            if sim < min(DOUBLE_DETECTION_SIM, MERGE_SIM_THRESHOLD):
+                continue
+            if not group_can_merge(groups[i], groups[j], sim):
+                continue
+            if sim > best_sim:
+                best_sim, best_i, best_j = sim, i, j
+    if best_i >= 0:
+        ti_repr = groups[best_i]
+        tj_repr = groups[best_j]
+        print(f"  合并: {[f't{t}' for t in ti_repr]} + {[f't{t}' for t in tj_repr]}  min_sim={best_sim:.3f}")
+        groups[best_i] = groups[best_i] + groups[best_j]
+        groups.pop(best_j)
+        merged_any = True
+
+if len(groups) == len(main_feat_tids):
+    print("  无需归并（所有主滑手 track 均为独立个体）")
+
+def _first_frame(tid):
+    segs = track_segments.get(tid, [(0, 0)])
+    return segs[0][0]
+
+# 按首次出场时间排序，构建 person_groups
+person_groups = {}
+for pid, grp in enumerate(
+        sorted(groups, key=lambda g: min(_first_frame(t) for t in g)), 1):
+    person_groups[pid] = sorted(grp, key=_first_frame)
+
+print(f"\n归并后共 {len(person_groups)} 位独立滑手:")
+for pid, tids in person_groups.items():
+    segs_info = "  ".join(
+        f"t{t}({_first_frame(t)/fps:.1f}s)" for t in tids)
+    print(f"  P{pid:02d}: {segs_info}")
 
 # ─────────────────────────────────────────────
 # 第二遍：渲染预览视频
@@ -602,81 +917,77 @@ out_writer.release()
 print(f"Preview video saved: {PREVIEW_PATH}")
 
 # ─────────────────────────────────────────────
-# 输出代表性截图表格
+# 输出分组截图表格（按 person_groups 归组）
 # ─────────────────────────────────────────────
 print("\n" + "="*50)
 print("Generating thumbnail sheet...")
 print("="*50)
 
-# 按聚类分组，主滑手群在前
-from collections import defaultdict as dd
-groups = dd(list)
-for tid in track_segments:
-    cid = cluster_map.get(tid, -1)
-    groups[cid].append(tid)
+# 布局参数
+COLS     = REID_FRAMES_PER_TRACK   # 每 track 显示几帧
+INFO_W   = 190                     # 左侧信息栏宽度
+ROW_H    = THUMB_H + 10            # 每个 track 行高
+HEADER_H = 40                      # 每个 person 组的标题栏高度
+GROUP_GAP = 16                     # 组间距
 
-ordered_groups = []
-if main_cluster in groups:
-    ordered_groups.append((main_cluster, groups[main_cluster]))
-for cid, tids in sorted(groups.items()):
-    if cid != main_cluster:
-        ordered_groups.append((cid, tids))
+# 构建待渲染列表：主滑手按 person 分组，背景人物统一放最后
+bg_tids = sorted(
+    [t for t in track_segments if cluster_map.get(t, -1) != main_cluster],
+    key=lambda t: track_segments[t][0][0])
 
-# 计算画布大小
-COLS       = REID_FRAMES_PER_TRACK
-INFO_W     = 180
-ROW_H      = THUMB_H + 10
-HEADER_H   = 36
-GROUP_GAP  = 20
-total_rows = sum(len(tids) for _,tids in ordered_groups)
-total_h    = HEADER_H * len(ordered_groups) + total_rows * ROW_H + GROUP_GAP * len(ordered_groups) + 60
+total_rows = sum(len(tids) for tids in person_groups.values()) + len(bg_tids)
+n_groups   = len(person_groups) + (1 if bg_tids else 0)
+total_h    = HEADER_H * n_groups + total_rows * ROW_H + GROUP_GAP * n_groups + 60
 total_w    = INFO_W + COLS * (THUMB_W + 4) + 20
 
-sheet = np.ones((total_h, total_w, 3), dtype=np.uint8) * 30
+sheet = np.ones((total_h, total_w, 3), dtype=np.uint8) * 22
 
-y = 20
-for cid, tids in ordered_groups:
-    color = get_color(cid)
-    tag   = "MAIN RIDERS" if cid == main_cluster else (f"GROUP {cid}" if cid >= 0 else "NOISE/BG")
+def draw_person_group(sheet, y, pid, tids, color):
+    n_passes = len(tids)
+    label = (f"P{pid:02d}  {n_passes} pass{'es' if n_passes>1 else ''}"
+             if pid > 0 else f"Background  ({len(tids)} tracks)")
+    cv2.rectangle(sheet, (0, y), (total_w, y + HEADER_H),
+                  tuple(int(c * 0.35) for c in color), -1)
+    cv2.putText(sheet, label, (10, y + 27),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+    y += HEADER_H + 2
 
-    # 组标题
-    cv2.rectangle(sheet,(0,y),(total_w,y+HEADER_H),
-                  tuple(int(c*0.4) for c in color),-1)
-    cv2.putText(sheet,f"Cluster {cid}: {tag}  ({len(tids)} tracks)",
-                (10,y+24),cv2.FONT_HERSHEY_SIMPLEX,0.65,color,2)
-    y += HEADER_H + 4
+    for tid in tids:
+        segs      = track_segments.get(tid, [(0, 0)])
+        start_sec = segs[0][0] / fps
+        end_sec   = segs[-1][1] / fps
+        dur       = sum((e - s) / fps for s, e in segs)
 
-    for tid in sorted(tids, key=lambda t: track_segments[t][0][0]):
-        segs = track_segments[tid]
-        start_sec = segs[0][0]/fps
-        end_sec   = segs[-1][1]/fps
-        total_dur = sum((e-s)/fps for s,e in segs)
+        cv2.putText(sheet, f"t{tid}", (6, y + 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, color, 1)
+        cv2.putText(sheet, f"{int(start_sec//60):02d}:{start_sec%60:04.1f}", (6, y + 38),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (170, 170, 170), 1)
+        cv2.putText(sheet, f"~{int(end_sec//60):02d}:{end_sec%60:04.1f}", (6, y + 54),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (170, 170, 170), 1)
+        cv2.putText(sheet, f"{dur:.1f}s", (6, y + 70),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, (90, 210, 90), 1)
 
-        # 左侧信息栏
-        cv2.putText(sheet,f"ID: {tid}",(6,y+20),
-                    cv2.FONT_HERSHEY_SIMPLEX,0.5,color,1)
-        cv2.putText(sheet,f"{int(start_sec//60):02d}:{start_sec%60:04.1f}",(6,y+38),
-                    cv2.FONT_HERSHEY_SIMPLEX,0.42,(180,180,180),1)
-        cv2.putText(sheet,f"~{int(end_sec//60):02d}:{end_sec%60:04.1f}",(6,y+54),
-                    cv2.FONT_HERSHEY_SIMPLEX,0.42,(180,180,180),1)
-        cv2.putText(sheet,f"{total_dur:.1f}s",(6,y+70),
-                    cv2.FONT_HERSHEY_SIMPLEX,0.5,(100,220,100),1)
-
-        # 代表帧截图
         crops = track_crops.get(tid, [])
         for i, crop in enumerate(crops[:COLS]):
             if crop is None or crop.size == 0:
                 continue
             thumb = cv2.resize(crop, (THUMB_W, THUMB_H))
-            tx = INFO_W + i*(THUMB_W+4)
-            sheet[y:y+THUMB_H, tx:tx+THUMB_W] = thumb
-            cv2.rectangle(sheet,(tx,y),(tx+THUMB_W,y+THUMB_H),color,2)
+            tx = INFO_W + i * (THUMB_W + 4)
+            sheet[y:y + THUMB_H, tx:tx + THUMB_W] = thumb
+            cv2.rectangle(sheet, (tx, y), (tx + THUMB_W, y + THUMB_H), color, 2)
 
-        # 行分隔线
-        cv2.line(sheet,(0,y+ROW_H-2),(total_w,y+ROW_H-2),(60,60,60),1)
+        cv2.line(sheet, (0, y + ROW_H - 2), (total_w, y + ROW_H - 2), (50, 50, 50), 1)
         y += ROW_H
 
-    y += GROUP_GAP
+    return y + GROUP_GAP
+
+y = 20
+for pid, tids in person_groups.items():
+    color = get_color(pid * 31)   # 每个 person 用固定颜色
+    y = draw_person_group(sheet, y, pid, tids, color)
+
+if bg_tids:
+    y = draw_person_group(sheet, y, 0, bg_tids, (80, 80, 80))
 
 cv2.imwrite(SHEET_PATH, sheet)
 print(f"Thumbnail sheet saved: {SHEET_PATH}")
@@ -688,31 +999,52 @@ print("\n" + "="*50)
 print("PASS 3: Exporting clip videos...")
 print("="*50)
 
-main_segs = []
-for tid in track_segments:
-    if cluster_map.get(tid, -1) == main_cluster:
-        for (s, e) in track_segments[tid]:
-            main_segs.append((s, e, tid))
-main_segs.sort(key=lambda x: x[0])
+# 按 person_groups 构建待导出片段列表（若无归并结果则回退到 cluster_map）
+if person_groups:
+    main_segs = []   # (start_f, end_f, tid, person_id)
+    for pid, tids in person_groups.items():
+        for tid in tids:
+            for (s, e) in track_segments.get(tid, []):
+                main_segs.append((s, e, tid, pid))
+    main_segs.sort(key=lambda x: x[0])
+else:
+    main_segs = []
+    for tid in track_segments:
+        if cluster_map.get(tid, -1) == main_cluster:
+            for (s, e) in track_segments[tid]:
+                main_segs.append((s, e, tid, 0))
+    main_segs.sort(key=lambda x: x[0])
 
 if not main_segs:
     print("No main rider segments found, skipping clip export.")
 else:
-    print(f"Exporting {len(main_segs)} clips for "
-          f"{len(set(t for _,_,t in main_segs))} main rider track(s)")
+    n_persons = len(set(pid for _,_,_,pid in main_segs))
+    print(f"Exporting {len(main_segs)} clips for {n_persons} unique rider(s)")
     cap3 = cv2.VideoCapture(VIDEO_PATH)
     pre_roll_frames  = int(PRE_ROLL_SECONDS * fps)
-    ux_tail_frames   = int(0.15 * fps)   # 体验感用途的硬性延长
-    for clip_n, (start_f, end_f, tid) in enumerate(main_segs, 1):
+    ux_tail_frames   = int(0.15 * fps)
+    for clip_n, (start_f, end_f, tid, pid) in enumerate(main_segs, 1):
+        # 独立短片段（未与其他 track 归并的单条 track）跳过，避免输出太短的接近段
+        pid_tids = person_groups.get(pid, [tid]) if person_groups else [tid]
+        raw_dur  = (end_f - start_f) / fps
+        if len(pid_tids) == 1 and raw_dur < MIN_OUTPUT_SECONDS:
+            print(f"  [skip] t{tid}: {raw_dur:.1f}s < MIN_OUTPUT_SECONDS, 已归并入组则不单独输出")
+            continue
         clip_start = max(0, start_f - pre_roll_frames)
-        # 结束：bbox 完全出画 + 0.15s 体验延长，下一位进入 ROI 时强制截止
-        if clip_n < len(main_segs):
-            next_start_f = main_segs[clip_n][0]
-            clip_end = min(end_f + ux_tail_frames, next_start_f - 1, total_frames - 1)
+        # 剪辑结束用 track_frame_exit（bbox 完全出画），fallback 到 end_f（ROI 内最后帧）
+        frame_exit_f = track_frame_exit.get(tid, end_f)
+        # 下一位（不同 person）进入时截止
+        next_diff_start = None
+        for nxt in main_segs[clip_n:]:
+            if nxt[3] != pid:
+                next_diff_start = nxt[0]
+                break
+        if next_diff_start is not None:
+            clip_end = min(frame_exit_f + ux_tail_frames, next_diff_start - 1, total_frames - 1)
         else:
-            clip_end = min(end_f + ux_tail_frames, total_frames - 1)
-        clip_path  = os.path.join(CLIPS_DIR, f"{_stem}_clip{clip_n:03d}_t{tid}.mp4")
-        out_clip   = cv2.VideoWriter(clip_path, fourcc, fps, (W, H))
+            clip_end = min(frame_exit_f + ux_tail_frames, total_frames - 1)
+        clip_path = os.path.join(CLIPS_DIR, f"{_stem}_p{pid:02d}_clip{clip_n:03d}_t{tid}.mp4")
+        out_clip  = cv2.VideoWriter(clip_path, fourcc, fps, (W, H))
         cap3.set(cv2.CAP_PROP_POS_FRAMES, clip_start)
         for _ in range(clip_end - clip_start + 1):
             ret, frm = cap3.read()
@@ -721,7 +1053,7 @@ else:
             out_clip.write(frm)
         out_clip.release()
         dur = (clip_end - clip_start) / fps
-        print(f"  [{clip_n:03d}] Rider {tid}: {clip_start/fps:.1f}s ~ {clip_end/fps:.1f}s  ({dur:.1f}s)  → {clip_path}")
+        print(f"  [{clip_n:03d}] P{pid:02d}/t{tid}: {clip_start/fps:.1f}s ~ {clip_end/fps:.1f}s  ({dur:.1f}s)  → {clip_path}")
     cap3.release()
 
 print(f"\nDone!")
