@@ -14,13 +14,17 @@ import random
 parser = argparse.ArgumentParser()
 parser.add_argument("--video", default=r"C:\RailJam_clipper\videos\input.mp4")
 parser.add_argument("--out-dir", default=r"C:\RailJam_clipper\output")
+parser.add_argument("--confirm", default=None,
+                    help="用户确认文件路径（JSON），填写后重新运行以应用分组决策")
 args = parser.parse_args()
 
 VIDEO_PATH = args.video
 _stem      = os.path.splitext(os.path.basename(VIDEO_PATH))[0]
 CLIPS_DIR  = args.out_dir
-PREVIEW_PATH = os.path.join(CLIPS_DIR, f"{_stem}_preview.mp4")
-SHEET_PATH   = os.path.join(CLIPS_DIR, f"{_stem}_sheet.jpg")
+PREVIEW_PATH        = os.path.join(CLIPS_DIR, f"{_stem}_preview.mp4")
+SHEET_PATH          = os.path.join(CLIPS_DIR, f"{_stem}_sheet.jpg")
+CONFIRM_SHEET_PATH  = os.path.join(CLIPS_DIR, f"{_stem}_confirm_sheet.jpg")
+CONFIRM_TMPL_PATH   = os.path.join(CLIPS_DIR, f"{_stem}_confirm_template.json")
 os.makedirs(CLIPS_DIR, exist_ok=True)
 
 # ========== 配置区 ==========
@@ -675,6 +679,149 @@ def can_merge(t1, t2, sim):
 main_feat_tids = [t for t in combined_feat_by_tid if t in main_tids_set]
 feat_by_tid    = {t: combined_feat_by_tid[t] for t in main_feat_tids}
 
+# ── 交互式确认 ──────────────────────────────────────────────────────────
+# 相似度区间：< CONFIRM_LOW → 自动分开  |  > CONFIRM_HIGH → 自动合并
+#             CONFIRM_LOW ~ CONFIRM_HIGH → 生成确认 sheet，等待用户决策
+CONFIRM_LOW  = 0.85
+CONFIRM_HIGH = 0.95
+import json
+
+# 1. 加载用户确认文件（若提供）
+user_confirm_sim = {}   # {(min_tid, max_tid): 1.0 (同一人) | 0.0 (不同人)}
+if args.confirm and os.path.exists(args.confirm):
+    with open(args.confirm, 'r', encoding='utf-8') as f:
+        confirm_data = json.load(f)
+    for pair_key, decision in confirm_data.get('pairs', {}).items():
+        if decision is None:
+            continue
+        ta, tb = pair_key.split('-')
+        key = (min(ta, tb), max(ta, tb))
+        user_confirm_sim[key] = 1.0 if decision else 0.0
+    print(f"已加载确认文件：{len(user_confirm_sim)} 条决策")
+
+def pair_sim(ta, tb):
+    """相似度查询：优先使用用户确认，否则计算特征余弦相似度"""
+    key = (min(ta, tb), max(ta, tb))
+    if key in user_confirm_sim:
+        return user_confirm_sim[key]
+    if ta in feat_by_tid and tb in feat_by_tid:
+        return cosine_sim(feat_by_tid[ta], feat_by_tid[tb])
+    return 0.0
+
+# 2. 找出待确认配对（只考虑时间约束允许合并的配对）
+sorted_tids = sorted(main_feat_tids, key=lambda x: int(x))
+uncertain_pairs = []
+for i, ta in enumerate(sorted_tids):
+    for tb in sorted_tids[i+1:]:
+        sim = pair_sim(ta, tb)
+        if not (CONFIRM_LOW <= sim <= CONFIRM_HIGH):
+            continue
+        gap = track_gap_seconds(ta, tb)
+        # 只有时间约束可能放行的配对才需要确认
+        in_split   = gap <= SPLIT_GAP_SECONDS
+        in_normal  = gap >= MIN_GAP_SECONDS
+        if not (in_split or in_normal):
+            continue
+        uncertain_pairs.append((ta, tb, sim, gap))
+uncertain_pairs.sort(key=lambda x: -x[2])
+
+# 3. 生成确认 sheet（每对滑手各取 3 张代表帧并排展示）
+def _pick_crops(tid, n=3):
+    """从 track_crops 中均匀选取 n 张质量合格的代表帧"""
+    crops = filter_crops(track_crops.get(tid, []))
+    if not crops:
+        return [np.zeros((CROP_H, CROP_W, 3), dtype=np.uint8)] * n
+    idxs = [int(i * (len(crops) - 1) / max(n - 1, 1)) for i in range(n)]
+    picked = []
+    for idx in idxs:
+        c = brighten_crop(cv2.resize(crops[idx], (CROP_W, CROP_H)))
+        picked.append(c)
+    return picked
+
+CROP_W, CROP_H = 120, 240
+N_CROPS        = 3
+INFO_W         = 220
+PAD            = 10
+ROW_H          = CROP_H + PAD * 2
+ROW_W          = N_CROPS * CROP_W + INFO_W + N_CROPS * CROP_W + PAD * 4
+
+def brighten_crop(img):
+    """CLAHE 自适应对比度增强，让深色衣物细节更可见"""
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 8))
+    l = clahe.apply(l)
+    return cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
+
+if uncertain_pairs:
+    sheet_rows = []
+    for ta, tb, sim, gap in uncertain_pairs:
+        key    = (min(ta, tb), max(ta, tb))
+        status = user_confirm_sim.get(key)   # 1.0 / 0.0 / None
+        row    = np.ones((ROW_H, ROW_W, 3), dtype=np.uint8) * 240
+
+        # 左侧：ta 的 crops
+        x = PAD
+        for crop in _pick_crops(ta, N_CROPS):
+            row[PAD:PAD+CROP_H, x:x+CROP_W] = crop
+            x += CROP_W
+
+        # 右侧：tb 的 crops
+        x = PAD * 2 + N_CROPS * CROP_W + INFO_W
+        for crop in _pick_crops(tb, N_CROPS):
+            row[PAD:PAD+CROP_H, x:x+CROP_W] = crop
+            x += CROP_W
+
+        # 中间信息面板
+        ix = N_CROPS * CROP_W + PAD * 2
+        cv2.rectangle(row, (ix, PAD), (ix + INFO_W - PAD, ROW_H - PAD),
+                      (220, 220, 220), -1)
+        font  = cv2.FONT_HERSHEY_SIMPLEX
+        label_color = (50, 50, 50)
+        cv2.putText(row, f"t{ta}  vs  t{tb}",
+                    (ix + 6, PAD + 30), font, 0.7, label_color, 1)
+        cv2.putText(row, f"sim = {sim:.3f}",
+                    (ix + 6, PAD + 62), font, 0.65, label_color, 1)
+        gap_str = f"gap = {gap:.1f}s" if gap >= 0 else "gap = overlap"
+        cv2.putText(row, gap_str,
+                    (ix + 6, PAD + 92), font, 0.65, label_color, 1)
+
+        if status is None:
+            decision_str, dc = "?  pending", (0, 140, 200)
+        elif status == 1.0:
+            decision_str, dc = "YES same", (0, 160, 0)
+        else:
+            decision_str, dc = "NO  diff", (0, 0, 200)
+        cv2.putText(row, decision_str, (ix + 6, PAD + 130), font, 0.75, dc, 2)
+
+        # ta / tb 标注
+        cv2.putText(row, f"t{ta}", (PAD, PAD + 16), font, 0.65, (30, 30, 180), 2)
+        cv2.putText(row, f"t{tb}",
+                    (PAD * 2 + N_CROPS * CROP_W + INFO_W, PAD + 16),
+                    font, 0.65, (30, 30, 180), 2)
+
+        # 分隔线
+        cv2.line(row, (0, ROW_H - 1), (ROW_W, ROW_H - 1), (180, 180, 180), 1)
+        sheet_rows.append(row)
+
+    confirm_sheet = np.vstack(sheet_rows)
+    cv2.imwrite(CONFIRM_SHEET_PATH, confirm_sheet)
+    print(f"确认 sheet 已生成：{CONFIRM_SHEET_PATH}  ({len(uncertain_pairs)} 对待确认)")
+
+    # 4. 生成确认模板 JSON（仅首次，不覆盖已有文件）
+    if not os.path.exists(CONFIRM_TMPL_PATH):
+        template = {'pairs': {}}
+        for ta, tb, sim, gap in uncertain_pairs:
+            template['pairs'][f'{ta}-{tb}'] = None
+        with open(CONFIRM_TMPL_PATH, 'w', encoding='utf-8') as f:
+            json.dump(template, f, indent=2, ensure_ascii=False)
+        print(f"确认模板已生成：{CONFIRM_TMPL_PATH}")
+        print("  → 将 null 改为 true（同一人）或 false（不同人），")
+        print("     然后用 --confirm 参数重新运行。")
+else:
+    print("无待确认配对（所有配对相似度均超出不确定区间）")
+# ────────────────────────────────────────────────────────────────────────
+
 # Complete-linkage 聚类：合并两组时要求所有跨组对均 >= 阈值，避免传递性误连
 groups = [[t] for t in main_feat_tids]  # 初始每人一组
 
@@ -694,17 +841,20 @@ def group_can_merge(g1, g2, sim):
     return True
 
 def group_min_sim(g1, g2):
-    """complete-linkage：取所有跨组对的最小相似度"""
-    return min(cosine_sim(feat_by_tid[t1], feat_by_tid[t2])
-               for t1 in g1 for t2 in g2
-               if t1 in feat_by_tid and t2 in feat_by_tid)
+    """complete-linkage：取所有跨组对的最小相似度（含用户确认覆盖）"""
+    return min(pair_sim(t1, t2) for t1 in g1 for t2 in g2)
 
 # 诊断：打印关注配对的相似度明细（OSNet分量 vs 颜色分量）
 DEBUG_PAIRS = [
+    # 同一人（期望高分）
     ('15','55'),('15','80'),('55','80'),
     ('34','35'),('34','76'),('35','76'),
-    ('42','43'),('42','100'),('43','100'),('100','101'),
-    ('100','102'),('101','102'),
+    ('42','43'),
+    ('98','100'),('98','101'),('100','101'),
+    # 不同人（期望低分）
+    ('98','102'),('100','102'),('101','102'),
+    ('42','98'),('42','100'),('43','98'),('43','100'),
+    ('34','102'),('76','102'),
     ('122','123'),
 ]
 if any(t in feat_by_tid for pair in DEBUG_PAIRS for t in pair):
