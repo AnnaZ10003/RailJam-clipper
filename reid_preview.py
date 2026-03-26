@@ -16,6 +16,10 @@ parser.add_argument("--video", default=r"C:\RailJam_clipper\videos\input.mp4")
 parser.add_argument("--out-dir", default=r"C:\RailJam_clipper\output")
 parser.add_argument("--confirm", default=None,
                     help="用户确认文件路径（JSON），填写后重新运行以应用分组决策")
+parser.add_argument("--labels", default=None,
+                    help="用户修正标签文件路径（JSON），用于 ML 分类器训练")
+parser.add_argument("--no-ml", action="store_true",
+                    help="禁用 ML 分类器，仅使用 K-means + 规则救援")
 args = parser.parse_args()
 
 VIDEO_PATH = args.video
@@ -25,6 +29,10 @@ PREVIEW_PATH        = os.path.join(CLIPS_DIR, f"{_stem}_preview.mp4")
 SHEET_PATH          = os.path.join(CLIPS_DIR, f"{_stem}_sheet.jpg")
 CONFIRM_SHEET_PATH  = os.path.join(CLIPS_DIR, f"{_stem}_confirm_sheet.jpg")
 CONFIRM_TMPL_PATH   = os.path.join(CLIPS_DIR, f"{_stem}_confirm_template.json")
+LABEL_TMPL_PATH     = os.path.join(CLIPS_DIR, f"{_stem}_track_labels_template.json")
+MODELS_DIR          = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+LABELS_DIR          = os.path.join(MODELS_DIR, "labels")
+MODEL_PATH          = os.path.join(MODELS_DIR, "track_classifier.joblib")
 os.makedirs(CLIPS_DIR, exist_ok=True)
 
 # ========== 配置区 ==========
@@ -115,7 +123,7 @@ print(f"Video: {W}x{H} @ {fps:.1f}fps  {total_frames}frames  {total_frames/fps:.
 # ── 预扫描：自动检测 ROI（基于实际人体出现位置）──
 print("Pre-scanning to auto-detect ROI...")
 cap_pre = cv2.VideoCapture(VIDEO_PATH)
-scan_cx, scan_cy = [], []
+scan_cx, scan_cy, scan_ty1 = [], [], []
 scan_idx = 0
 while True:
     ret, frm = cap_pre.read()
@@ -131,18 +139,22 @@ while True:
                 if conf > CONF_THRESHOLD and bh > H * 0.06:
                     scan_cx.append((x1 + x2) // 2)
                     scan_cy.append((y1 + y2) // 2)
+                    scan_ty1.append(y1)          # bbox 顶边，用于上缘扩展
     scan_idx += 1
 cap_pre.release()
 
 if len(scan_cx) >= 3:
-    cx_arr = np.array(scan_cx)
-    cy_arr = np.array(scan_cy)
-    pad_x = int(W * 0.07)
-    pad_y = int(H * 0.04)
-    roi_x1 = max(0,   int(np.percentile(cx_arr,  3)) - pad_x)
-    roi_x2 = min(W-1, int(np.percentile(cx_arr, 97)) + pad_x)
-    roi_y1 = max(0,   int(np.percentile(cy_arr,  3)) - pad_y)
-    roi_y2 = min(H-1, int(np.percentile(cy_arr, 97)) + pad_y)
+    cx_arr  = np.array(scan_cx)
+    cy_arr  = np.array(scan_cy)
+    ty1_arr = np.array(scan_ty1)
+    pad_x     = int(W * 0.07)
+    pad_y_bot = int(H * 0.04)
+    pad_y_top = int(H * 0.04)
+    roi_x1 = max(0,   int(np.percentile(cx_arr,   3)) - pad_x)
+    roi_x2 = min(W-1, int(np.percentile(cx_arr,  97)) + pad_x)
+    # 上缘用 bbox 顶边的低百分位，确保跳跃时上半身也在 ROI 内
+    roi_y1 = max(0,   int(np.percentile(ty1_arr,  3)) - pad_y_top)
+    roi_y2 = min(H-1, int(np.percentile(cy_arr,  97)) + pad_y_bot)
     print(f"Auto-ROI: x={roi_x1/W:.2f}~{roi_x2/W:.2f}  y={roi_y1/H:.2f}~{roi_y2/H:.2f}  ({len(scan_cx)} detections)")
 else:
     roi_x1, roi_x2 = int(ROI_X1*W), int(ROI_X2*W)
@@ -538,42 +550,199 @@ if len(features) >= 2:
     valid_h_tids = [t for t in per_track_h if t not in ghost_tids]
     print(f"  Ghost tracks removed ({len(ghost_tids)}): {sorted(ghost_tids, key=lambda x:int(x))}")
 
-    # Step3：K-means对avg_h自动二分
-    from sklearn.cluster import KMeans
-    if len(valid_h_tids) >= 2:
-        h_arr = np.array([per_track_h[t] for t in valid_h_tids]).reshape(-1,1)
-        km = KMeans(n_clusters=2, random_state=42, n_init=10)
-        km_labels = km.fit_predict(h_arr)
-        c0, c1 = float(km.cluster_centers_[0]), float(km.cluster_centers_[1])
-        main_km_lbl = 0 if c0 > c1 else 1   # 高度大的那组是主滑手
-        threshold = (c0 + c1) / 2
-        h_ratio = min(c0, c1) / max(c0, c1) if max(c0, c1) > 0 else 1.0
-        print(f"  KMeans avg_h: {c0:.0f}px vs {c1:.0f}px → threshold={threshold:.0f}px  ratio={h_ratio:.2f}")
-        if h_ratio > 0.72:
-            # 两组高度太接近 → 无背景人物，全部视为主滑手
-            print(f"  Height ratio {h_ratio:.2f} > 0.72 → no background detected, all treated as MAIN RIDERS")
-            main_tids_set = set(valid_h_tids)
-            bg_tids_set   = set()
+    # Step2b：计算每个 track 的净水平位移（方向判断用）和有符号速度（K-means 用）
+    # track_net_vx      : 净水平位移（px），符号代表方向，用于方向过滤
+    # track_signed_speed: 净水平位移 / 轨迹帧数（px/frame），同时编码方向和速度
+    track_net_vx     = {}
+    track_signed_speed = {}
+    # track_dominant_dir: 所有相邻帧间 X 位移的中位数方向（-1/0/+1）
+    # 比 net_vx 符号更可靠——即使起终点相近，若全程主要向某方向运动也能正确反映
+    # 典型反例：先向右走一段再向左返回，net_vx≈0 但 dominant_dir=-1
+    track_dominant_dir = {}
+    for tid, positions in track_positions.items():
+        if len(positions) < 4:
+            track_dominant_dir[tid] = 0
+            continue
+        n = max(2, len(positions) // 5)
+        first_x = np.mean([p[0] for p in positions[:n]])
+        last_x  = np.mean([p[0] for p in positions[-n:]])
+        net_vx = last_x - first_x
+        track_net_vx[tid]      = net_vx
+        track_signed_speed[tid] = net_vx / len(positions)
+        # 主导方向：统计"快速移动帧"正/负计数比，而非所有帧的中位数
+        # 解决问题：主滑手快速通过（+10px/帧）后若被缓慢漂移（-3px/帧）长时间追踪，
+        # 若用中位数则漂移帧数多会压倒正向 → 误判为反向
+        # 方向一致性规则：
+        #   |dx| >= FAST_DX → 快速帧（有明确方向意义）
+        #   pos_count >= 2 * neg_count → 主导正向 (+1)
+        #   neg_count >= 2 * pos_count → 主导反向 (-1)
+        #   否则 → 混合/不明确 (0)
+        FAST_DX = 5.0   # px/frame；快速移动阈值（约 150px/s @ 30fps）
+        diffs_x  = [positions[i+1][0] - positions[i][0] for i in range(len(positions) - 1)]
+        pos_count = sum(1 for dx in diffs_x if dx >=  FAST_DX)
+        neg_count = sum(1 for dx in diffs_x if dx <= -FAST_DX)
+        total_fast = pos_count + neg_count
+        if total_fast < 3:
+            track_dominant_dir[tid] = 0   # 快速帧太少，方向不明确
+        elif pos_count >= 2 * neg_count:
+            track_dominant_dir[tid] = +1
+        elif neg_count >= 2 * pos_count:
+            track_dominant_dir[tid] = -1
         else:
-            main_tids_set = {t for t,lbl in zip(valid_h_tids, km_labels) if lbl==main_km_lbl}
-            bg_tids_set   = {t for t,lbl in zip(valid_h_tids, km_labels) if lbl!=main_km_lbl}
+            track_dominant_dir[tid] = 0   # 正反向快速帧数量相当，混合运动
+
+    # Step2c：轨迹稳定性过滤 — 持续性大跳变 → 漂移框（在多人身上跳来跳去）
+    # 主滑手跳跃只有 1-2 帧大位移，漂移框则多帧持续跳变
+    # 使用欧氏距离（X+Y 两方向）：漂移框可能在水平或垂直方向跳变，只查 X 会漏检
+    STABILITY_JUMP_MAX      = 0.20   # 单步欧氏跳变 > 20% 帧对角线算"大跳"
+    STABILITY_JUMP_FRACTION = 0.08   # 大跳帧占比超过 8% → 判定为漂移框
+    diag = (W**2 + H**2) ** 0.5
+    unstable_tids = set()
+    for tid in list(valid_h_tids):
+        positions = track_positions.get(tid, [])
+        if len(positions) >= 5:
+            jumps = [
+                ((positions[i+1][0] - positions[i][0])**2 +
+                 (positions[i+1][1] - positions[i][1])**2) ** 0.5 / diag
+                for i in range(len(positions) - 1)
+            ]
+            frac = sum(1 for j in jumps if j > STABILITY_JUMP_MAX) / len(jumps)
+            if frac > STABILITY_JUMP_FRACTION:
+                unstable_tids.add(tid)
+    if unstable_tids:
+        valid_h_tids = [t for t in valid_h_tids if t not in unstable_tids]
+        print(f"  [稳定性过滤] 漂移框移除 ({len(unstable_tids)}): "
+              f"{sorted(unstable_tids, key=lambda x:int(x))}")
+
+    # Step3：K-means 三分（avg_h + net_vx）
+    # 场景实际存在三类人群：
+    #   [main]   主滑手     — 框大、净位移高正值（快速横穿道具）
+    #   [walker] 同向围观者 — 框中小、净位移小正值（慢速同向移动）
+    #   [drag]   拖牵返回者 — 框小、净位移负值（反向返回）
+    # 3-cluster 能明确分离三类，避免主滑手（框偏小时）被归入背景大组。
+    # walker 组与主滑手方向相同，救援时使用较低阈值；drag 组方向预检后基本不被救援。
+    # 样本不足 15 条时退化为 2-cluster（简单视频）。
+    from sklearn.cluster import KMeans
+    bg_drag_tids_set = set()   # 拖牵/反向背景（严格过滤）
+    bg_same_tids_set = set()   # 同向围观者（软过滤，可低阈值救援）
+
+    if len(valid_h_tids) >= 2:
+        h_vals  = np.array([per_track_h[t]          for t in valid_h_tids], dtype=float)
+        vx_vals = np.array([track_net_vx.get(t, 0.) for t in valid_h_tids], dtype=float)
+        # 各特征独立标准化，使两维度量级相当
+        h_std  = h_vals.std()  + 1e-8
+        vx_std = vx_vals.std() + 1e-8
+        feats_2d = np.column_stack([
+            (h_vals  - h_vals.mean())  / h_std,
+            (vx_vals - vx_vals.mean()) / vx_std,
+        ])
+
+        use_3cluster = len(valid_h_tids) >= 15
+        n_clusters   = 3 if use_3cluster else 2
+        km = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+        km_labels = km.fit_predict(feats_2d)
+
+        c_h  = np.array([h_vals[km_labels == k].mean()  for k in range(n_clusters)])
+        c_vx = np.array([vx_vals[km_labels == k].mean() for k in range(n_clusters)])
+
+        if use_3cluster:
+            main_km_lbl = int(np.argmax(c_h))          # 框最高 = 主滑手
+            drag_km_lbl = int(np.argmin(c_vx))          # 最负向 = 拖牵返回者
+            # 保证三个 label 各不相同（边界情况处理）
+            if main_km_lbl == drag_km_lbl:
+                drag_km_lbl = int(np.argsort(c_vx)[1])
+            same_km_lbl = [k for k in range(3)
+                           if k != main_km_lbl and k != drag_km_lbl][0]
+            print(f"  KMeans 3-cluster:")
+            print(f"    Main   (c{main_km_lbl}): h={c_h[main_km_lbl]:.0f}px  vx={c_vx[main_km_lbl]:+.0f}px")
+            print(f"    Drag   (c{drag_km_lbl }): h={c_h[drag_km_lbl ]:.0f}px  vx={c_vx[drag_km_lbl ]:+.0f}px")
+            print(f"    Walker (c{same_km_lbl }): h={c_h[same_km_lbl ]:.0f}px  vx={c_vx[same_km_lbl ]:+.0f}px")
+            main_tids_set    = {t for t, lbl in zip(valid_h_tids, km_labels) if lbl == main_km_lbl}
+            bg_drag_tids_set = {t for t, lbl in zip(valid_h_tids, km_labels) if lbl == drag_km_lbl}
+            bg_same_tids_set = {t for t, lbl in zip(valid_h_tids, km_labels) if lbl == same_km_lbl}
+            bg_tids_set      = bg_drag_tids_set | bg_same_tids_set
+            # 若拖牵组 avg_vx 也是正值，说明本视频无明显反向群体，降级为全部同向背景
+            if c_vx[drag_km_lbl] >= 0:
+                print(f"  拖牵组 vx={c_vx[drag_km_lbl]:+.0f}px ≥ 0，无明显反向群体 → 合并两背景组为 walker")
+                bg_same_tids_set |= bg_drag_tids_set
+                bg_drag_tids_set  = set()
+        else:
+            # 2-cluster 退化模式
+            main_km_lbl = int(np.argmax(c_h))
+            h_ratio = (min(c_h) / max(c_h)) if max(c_h) > 0 else 1.0
+            print(f"  KMeans 2-cluster: h=[{c_h[0]:.0f}, {c_h[1]:.0f}]px  "
+                  f"vx=[{c_vx[0]:+.0f}, {c_vx[1]:+.0f}]px  ratio={h_ratio:.2f}")
+            if h_ratio > 0.72 and abs(c_vx[0] - c_vx[1]) < W * 0.05:
+                print(f"  h_ratio={h_ratio:.2f}>0.72 且 vx 差异小 → 无背景人物，全部视为主滑手")
+                main_tids_set = set(valid_h_tids)
+                bg_tids_set   = set()
+            else:
+                main_tids_set = {t for t, lbl in zip(valid_h_tids, km_labels) if lbl == main_km_lbl}
+                bg_tids_set   = {t for t, lbl in zip(valid_h_tids, km_labels) if lbl != main_km_lbl}
+                bg_same_tids_set = bg_tids_set  # 2-cluster 时无法区分，统一视为 walker
     else:
         main_tids_set = set(valid_h_tids)
         bg_tids_set   = set()
-        threshold = 0
-
+    bg_tids_set.update(unstable_tids)
     bg_tids_set.update(ghost_tids)
 
-    # Step4：背景救援 — 对背景组里的 track 计算与主滑手组的 Re-ID 相似度，
-    # 分级阈值：
-    #   ≤ SPLIT_GAP_SECONDS 内的背景 track → 视为"接近道具阶段"被误分，用 DOUBLE_DETECTION_SIM
-    #   其余 → 用 RESCUE_SIM_THRESHOLD
-    RESCUE_SIM_THRESHOLD = 0.87
-    all_feat_by_tid = combined_feat_by_tid   # 已包含 OSNet + 颜色直方图
+    # Step4：背景救援 — 对背景组里的 track 计算与主滑手组的 Re-ID 相似度
+    # 两档阈值：
+    #   drag 组（反向）：方向预检几乎不会进入救援；进入的用严格阈值
+    #   walker 组（同向围观者）：方向相同，用较低阈值，避免漏抓小框主滑手
+    RESCUE_SIM_DRAG   = 0.87   # 拖牵/反向组救援阈值
+    RESCUE_SIM_WALKER = 0.87   # 同向围观者组阈值：与 drag 相同（冬运服装相似度天然高，0.82 太宽松）
+    all_feat_by_tid = combined_feat_by_tid
+
+    # ── 救援前预清洗：从 K-means 主组中移除疑似漂移框 ──
+    # 漂移框特征：在主组中（大框/大正位移），但 dominant_dir 反向
+    # 说明它短暂锁定在主滑手身上（获得大h和大net_vx），然后漂移回来
+    # 若保留在主组，将作为错误的救援锚点，引入大量误救
+    # 从 K-means 主组计算初步主流方向（先用 net_vx，dominant_dir 还未完全验证）
+    prelim_vx = [track_net_vx[t] for t in main_tids_set
+                 if t in track_net_vx and abs(track_net_vx[t]) > W * 0.04]
+    main_dir_prelim = int(np.sign(np.median(prelim_vx))) if len(prelim_vx) >= 2 else 0
+
+    drift_removed = set()
+    if main_dir_prelim != 0:
+        for tid in list(main_tids_set):
+            dom = track_dominant_dir.get(tid, 0)
+            if dom != 0 and dom != main_dir_prelim:
+                # dominant_dir 反向 → 疑似漂移框，移出主组
+                drift_removed.add(tid)
+    if drift_removed:
+        main_tids_set -= drift_removed
+        bg_same_tids_set |= drift_removed   # 允许后续低阈值救援（万一是真实主滑手）
+        bg_tids_set      |= drift_removed
+        print(f"  [主组预清洗] 移除疑似漂移框 ({len(drift_removed)}): "
+              f"{sorted(drift_removed, key=lambda x:int(x))}")
+
     rescued = set()
     for bg_tid in list(bg_tids_set):
         if bg_tid not in all_feat_by_tid:
             continue
+        bg_vx = track_net_vx.get(bg_tid, 0)
+        is_walker = bg_tid in bg_same_tids_set  # 同向围观者组（宽松救援）
+
+        # 拖牵组：dominant_dir=-1（方向确认反向）→ 直接阻断
+        # dominant_dir=0（方向未知）+ 极高相似度(≥0.925) → 允许第二轮救援（见下方 rescued2）
+        if bg_tid in bg_drag_tids_set:
+            bg_dominant_pre = track_dominant_dir.get(bg_tid, 0)
+            if bg_dominant_pre == -1:
+                continue   # 方向确认反向 → 硬阻断
+            # 方向未知的拖牵轨迹：由第二轮救援（rescued2）处理，使用扩大后的主组更准确
+            continue
+
+        # 方向预检（dominant_dir + net_vx 双重确认才阻断）：
+        # 仅 dominant_dir 反向但 net_vx 明确同向 → 可能是轨迹噪声，允许救援
+        # 两者都反向 → 确定为反向，阻断
+        bg_dominant = track_dominant_dir.get(bg_tid, 0)
+        vx_clearly_main = abs(bg_vx) > W * 0.06 and int(np.sign(bg_vx)) == main_dir_prelim
+        if main_dir_prelim != 0 and bg_dominant != 0 and bg_dominant != main_dir_prelim:
+            if not vx_clearly_main:   # net_vx 也不是明确同向 → 双重确认反向，阻断
+                continue
+            # else: dominant 反向但 net_vx 明确同向 → 轨迹噪声，允许通过（下面的救援阈值会再把关）
+
         best_sim, best_main = 0.0, None
         for m_tid in main_tids_set:
             if m_tid not in all_feat_by_tid:
@@ -585,20 +754,218 @@ if len(features) >= 2:
                 best_sim, best_main = sim, m_tid
         if best_main is None:
             continue
+
         gap = track_gap_seconds(bg_tid, best_main)
-        # 接近段（gap ≤ SPLIT_GAP）用宽松阈值；其余用标准阈值
-        # 不做空间中心距检测——跳跃动作会导致同一人 bbox 中心点大幅偏移
-        threshold = DOUBLE_DETECTION_SIM if gap <= SPLIT_GAP_SECONDS else RESCUE_SIM_THRESHOLD
+        if gap <= 0:
+            # 时间实际重叠（gap≤0）：两条轨迹同时存在，必然是不同人
+            # 注意：Python 中 -0.0 < 0 为 False，所以用 ≤ 0 而非 < 0
+            # Walker 组 + 同时存在 → 双重否定，直接阻断
+            if is_walker:
+                continue
+            # 若方向也相反，更不应该救援
+            if bg_dominant != 0 and bg_dominant != main_dir_prelim:
+                continue
+            threshold = RESCUE_SIM_DRAG             # 0.87 — 比双检测阈值更严格
+        elif gap <= SPLIT_GAP_SECONDS:
+            threshold = DOUBLE_DETECTION_SIM        # 极短间隔：可能是同人轨迹断裂
+        elif is_walker:
+            threshold = RESCUE_SIM_WALKER           # 同向围观者组：宽松
+        else:
+            threshold = RESCUE_SIM_DRAG             # 拖牵/其他背景：严格
+
         if best_sim >= threshold:
             rescued.add(bg_tid)
-            print(f"  [Rescue] t{bg_tid} 从背景组拉回 → 与 t{best_main} 相似度={best_sim:.3f}  gap={gap:.1f}s")
+            tag = "walker" if is_walker else "drag"
+            print(f"  [Rescue/{tag}] t{bg_tid} 从背景组拉回 → 与 t{best_main} "
+                  f"相似度={best_sim:.3f}  gap={gap:.1f}s  vx={bg_vx:+.0f}px")
     main_tids_set |= rescued
     bg_tids_set   -= rescued
     if rescued:
         print(f"  共救援 {len(rescued)} 个 track: {sorted(rescued, key=lambda x:int(x))}")
 
-    print(f"  MAIN RIDERS ({len(main_tids_set)}): {sorted(main_tids_set, key=lambda x:int(x))}")
-    print(f"  BACKGROUND  ({len(bg_tids_set)}):  {sorted(bg_tids_set,  key=lambda x:int(x))}")
+    # ── 第二轮救援：拖牵组 dominant_dir=0 (方向未知) tracks ──
+    # 第一轮救援扩大了 main_tids_set（如 t114 等），此时再检查拖牵组相似度更准确
+    rescued2 = set()
+    for bg_tid in list(bg_drag_tids_set - main_tids_set):
+        if track_dominant_dir.get(bg_tid, 0) == -1:
+            continue   # 方向确认反向 → 硬阻断
+        if bg_tid not in all_feat_by_tid:
+            continue
+        best_sim2, best_main2 = 0.0, None
+        for m_tid in main_tids_set:
+            if m_tid not in all_feat_by_tid: continue
+            s = float(np.dot(
+                all_feat_by_tid[bg_tid] / (np.linalg.norm(all_feat_by_tid[bg_tid]) + 1e-8),
+                all_feat_by_tid[m_tid] / (np.linalg.norm(all_feat_by_tid[m_tid]) + 1e-8)))
+            if s > best_sim2: best_sim2, best_main2 = s, m_tid
+        if best_main2 is None: continue
+        gap2 = track_gap_seconds(bg_tid, best_main2)
+        if gap2 <= 0: continue   # 同时存在 → 不可能同人
+        if best_sim2 >= 0.925:
+            rescued2.add(bg_tid)
+            print(f"  [Rescue2/drag-unk] t{bg_tid} → t{best_main2} sim={best_sim2:.3f} gap={gap2:.1f}s")
+    if rescued2:
+        main_tids_set |= rescued2
+        bg_tids_set   -= rescued2
+        bg_drag_tids_set -= rescued2
+        print(f"  第二轮救援 {len(rescued2)} 个 drag-unknown track: {sorted(rescued2, key=lambda x:int(x))}")
+
+    # ── 方向过滤：主导运动方向与主滑手相反 → 直接移入背景（无需高并发条件）──
+    # 使用 dominant_dir（逐帧位移中位数方向），比 net_vx 更能反映真实运动方向。
+    # 先前版本要求"反向 AND 高并发"，导致单独反向者漏网；现改为反向即过滤。
+    # 高并发条件保留作为补充：同向但高密度者也有嫌疑（同向围观者群体）。
+
+    # 从主滑手组中确定主流方向（dominant_dir 中位数）
+    main_dom_vals = [track_dominant_dir[t] for t in main_tids_set
+                     if track_dominant_dir.get(t, 0) != 0]
+    main_dir = int(np.sign(np.median(main_dom_vals))) if len(main_dom_vals) >= 3 else 0
+
+    # 统计每帧所有 track（含背景）的并发数，反映真实人群密度
+    MAX_CONCURRENT = 4
+    frame_all_active = defaultdict(set)
+    for tid, segs in track_segments.items():
+        for sf, ef in segs:
+            for f in range(sf, ef + 1, 3):
+                frame_all_active[f].add(tid)
+
+    track_max_concurrent = {}
+    for tid, segs in track_segments.items():
+        max_conc = max(
+            (len(frame_all_active[f]) - 1 for sf, ef in segs
+             for f in range(sf, ef + 1, 3) if frame_all_active[f]),
+            default=0
+        )
+        track_max_concurrent[tid] = max_conc
+
+    # 后置过滤：dominant_dir 反向 AND 高并发 → 漏网的背景人物
+    # 仅凭方向（没有密度验证）过滤风险高（主滑手轨迹可能因噪声方向误判），
+    # 结合高并发可大大降低误删主滑手的概率（主滑手出现时并发数通常较低）
+    combined_filtered = set()
+    if main_dir != 0:
+        for tid in list(main_tids_set):
+            dom = track_dominant_dir.get(tid, 0)
+            is_wrong_dir    = dom != 0 and dom != main_dir
+            is_high_density = track_max_concurrent.get(tid, 0) > MAX_CONCURRENT
+            if is_wrong_dir and is_high_density:
+                combined_filtered.add(tid)
+    if combined_filtered:
+        main_tids_set -= combined_filtered
+        bg_tids_set   |= combined_filtered
+        print(f"  [联合过滤] 移入背景 {len(combined_filtered)} 个 (dominant反向+高并发): "
+              f"{sorted(combined_filtered, key=lambda x:int(x))}")
+
+    print(f"  [K-means] MAIN RIDERS ({len(main_tids_set)}): {sorted(main_tids_set, key=lambda x:int(x))}")
+    print(f"  [K-means] BACKGROUND  ({len(bg_tids_set)}):  {sorted(bg_tids_set,  key=lambda x:int(x))}")
+
+    # ── ML 分类器 ──────────────────────────────────────────────────────
+    # 用 GBT 分类器替代/增强 K-means + 规则救援
+    # 冷启动（无模型）→ 保留 K-means 结果并生成标签模板
+    # 有模型 → GBT predict_proba → P>0.5 为主滑手
+    from track_classifier import (
+        compute_all_features, TrackClassifier,
+        bootstrap_labels_from_kmeans, save_labels, load_labels,
+        save_label_template, train_from_label_files,
+    )
+
+    # 计算主组质心（Re-ID 特征均值）
+    main_feats = [combined_feat_by_tid[t] for t in main_tids_set
+                  if t in combined_feat_by_tid]
+    main_centroid = np.mean(main_feats, axis=0) if main_feats else None
+
+    # 提取全部 track 的 20 维特征
+    all_classify_tids = list(set(list(main_tids_set) + list(bg_tids_set)))
+    features_by_tid = compute_all_features(
+        all_classify_tids,
+        W=W, H=H, fps=fps,
+        track_positions=track_positions,
+        track_segments=track_segments,
+        track_net_vx=track_net_vx,
+        track_signed_speed=track_signed_speed,
+        track_dominant_dir=track_dominant_dir,
+        per_track_h=per_track_h,
+        per_track_dark=per_track_dark,
+        track_hit_entry=track_hit_entry,
+        track_hit_exit=track_hit_exit,
+        track_max_concurrent=track_max_concurrent,
+        combined_feat_by_tid=combined_feat_by_tid,
+        main_tids_set=main_tids_set,
+        main_centroid=main_centroid,
+        track_crops=track_crops,
+    )
+    print(f"  [ML] 特征提取完成: {len(features_by_tid)} tracks × 20 features")
+
+    ml_used = False
+    if not args.no_ml:
+        # 尝试加载已有模型
+        classifier = TrackClassifier.load(MODEL_PATH)
+
+        # 如果有用户修正标签 → 重新训练
+        if args.labels and os.path.exists(args.labels):
+            # 复制用户标签到 labels 目录
+            import shutil
+            os.makedirs(LABELS_DIR, exist_ok=True)
+            dest = os.path.join(LABELS_DIR, os.path.basename(args.labels))
+            if os.path.abspath(args.labels) != os.path.abspath(dest):
+                shutil.copy2(args.labels, dest)
+            print(f"  [ML] 加载用户标签: {args.labels}")
+
+        # 尝试从 labels 目录聚合训练
+        if os.path.isdir(LABELS_DIR):
+            trained = train_from_label_files(LABELS_DIR)
+            if trained is not None:
+                classifier = trained
+                classifier.save(MODEL_PATH)
+                print(f"  [ML] 模型已保存: {MODEL_PATH}")
+
+        # 用分类器预测
+        if classifier is not None:
+            proba = classifier.predict_proba(features_by_tid)
+            ml_main = {tid for tid, p in proba.items() if p > 0.5}
+            ml_bg = {tid for tid in all_classify_tids if tid not in ml_main}
+
+            # 方向安全网：dominant_dir 反向 + 高并发 → 强制背景
+            if main_dir != 0:
+                for tid in list(ml_main):
+                    dom = track_dominant_dir.get(tid, 0)
+                    if dom != 0 and dom != main_dir and track_max_concurrent.get(tid, 0) > MAX_CONCURRENT:
+                        ml_main.discard(tid)
+                        ml_bg.add(tid)
+
+            print(f"  [ML] 分类器预测:")
+            print(f"    MAIN ({len(ml_main)}): {sorted(ml_main, key=lambda x:int(x))}")
+            print(f"    BG   ({len(ml_bg)}):   {sorted(ml_bg, key=lambda x:int(x))}")
+
+            # 显示 K-means vs ML 的差异
+            km_only = main_tids_set - ml_main
+            ml_only = ml_main - main_tids_set
+            if km_only:
+                print(f"    K-means→main, ML→bg: {sorted(km_only, key=lambda x:int(x))}")
+            if ml_only:
+                print(f"    K-means→bg, ML→main: {sorted(ml_only, key=lambda x:int(x))}")
+
+            main_tids_set = ml_main
+            bg_tids_set = ml_bg
+            ml_used = True
+        else:
+            print(f"  [ML] 无可用模型，使用 K-means 结果 (冷启动)")
+
+    # 生成/保存标签（无论是否使用 ML）
+    os.makedirs(LABELS_DIR, exist_ok=True)
+    kmeans_labels = bootstrap_labels_from_kmeans(
+        main_tids_set, bg_drag_tids_set, bg_same_tids_set,
+        ghost_tids, unstable_tids,
+    )
+    labels_path = os.path.join(LABELS_DIR, f"{_stem}_labels.json")
+    save_labels(kmeans_labels, features_by_tid, labels_path)
+    print(f"  [ML] 标签已保存: {labels_path}")
+
+    # 生成用户可编辑模板
+    save_label_template(all_classify_tids, main_tids_set, features_by_tid,
+                        LABEL_TMPL_PATH)
+    print(f"  [ML] 标签模板已生成: {LABEL_TMPL_PATH}")
+
+    print(f"  FINAL MAIN RIDERS ({len(main_tids_set)}): {sorted(main_tids_set, key=lambda x:int(x))}")
+    print(f"  FINAL BACKGROUND  ({len(bg_tids_set)}):  {sorted(bg_tids_set,  key=lambda x:int(x))}")
 
     # Step5：用结果覆盖cluster_map（main_cluster=2保持不变作为标记）
     main_cluster = 2
@@ -843,35 +1210,6 @@ def group_can_merge(g1, g2, sim):
 def group_min_sim(g1, g2):
     """complete-linkage：取所有跨组对的最小相似度（含用户确认覆盖）"""
     return min(pair_sim(t1, t2) for t1 in g1 for t2 in g2)
-
-# 诊断：打印关注配对的相似度明细（OSNet分量 vs 颜色分量）
-DEBUG_PAIRS = [
-    # 同一人（期望高分）
-    ('15','55'),('15','80'),('55','80'),
-    ('34','35'),('34','76'),('35','76'),
-    ('42','43'),
-    ('98','100'),('98','101'),('100','101'),
-    # 不同人（期望低分）
-    ('98','102'),('100','102'),('101','102'),
-    ('42','98'),('42','100'),('43','98'),('43','100'),
-    ('34','102'),('76','102'),
-    ('122','123'),
-]
-if any(t in feat_by_tid for pair in DEBUG_PAIRS for t in pair):
-    print("\n--- 关注配对相似度明细 ---")
-    osnet_dim = features[0].shape[0] if len(features) > 0 else 512
-    for ta, tb in DEBUG_PAIRS:
-        if ta not in feat_by_tid or tb not in feat_by_tid:
-            continue
-        fa, fb = feat_by_tid[ta], feat_by_tid[tb]
-        sim_total = cosine_sim(fa, fb)
-        # 拆分 OSNet 和颜色两段
-        fa_o, fa_c = fa[:osnet_dim], fa[osnet_dim:]
-        fb_o, fb_c = fb[:osnet_dim], fb[osnet_dim:]
-        sim_o = cosine_sim(fa_o, fb_o) if fa_o.size > 0 else 0
-        sim_c = cosine_sim(fa_c, fb_c) if fa_c.size > 0 else 0
-        gap = track_gap_seconds(ta, tb)
-        print(f"  t{ta}+t{tb}: total={sim_total:.3f}  osnet={sim_o:.3f}  color={sim_c:.3f}  gap={gap:.1f}s")
 
 print("\n--- Re-ID 归并 (complete-linkage, 阈值={}) ---".format(MERGE_SIM_THRESHOLD))
 merged_any = True
