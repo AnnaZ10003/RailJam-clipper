@@ -16,6 +16,10 @@ parser.add_argument("--video", default=r"C:\RailJam_clipper\videos\input.mp4")
 parser.add_argument("--out-dir", default=r"C:\RailJam_clipper\output")
 parser.add_argument("--confirm", default=None,
                     help="用户确认文件路径（JSON），填写后重新运行以应用分组决策")
+parser.add_argument("--labels", default=None,
+                    help="用户修正标签文件路径（JSON），用于 ML 分类器训练")
+parser.add_argument("--no-ml", action="store_true",
+                    help="禁用 ML 分类器，仅使用 K-means + 规则救援")
 args = parser.parse_args()
 
 VIDEO_PATH = args.video
@@ -25,6 +29,10 @@ PREVIEW_PATH        = os.path.join(CLIPS_DIR, f"{_stem}_preview.mp4")
 SHEET_PATH          = os.path.join(CLIPS_DIR, f"{_stem}_sheet.jpg")
 CONFIRM_SHEET_PATH  = os.path.join(CLIPS_DIR, f"{_stem}_confirm_sheet.jpg")
 CONFIRM_TMPL_PATH   = os.path.join(CLIPS_DIR, f"{_stem}_confirm_template.json")
+LABEL_TMPL_PATH     = os.path.join(CLIPS_DIR, f"{_stem}_track_labels_template.json")
+MODELS_DIR          = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+LABELS_DIR          = os.path.join(MODELS_DIR, "labels")
+MODEL_PATH          = os.path.join(MODELS_DIR, "track_classifier.joblib")
 os.makedirs(CLIPS_DIR, exist_ok=True)
 
 # ========== 配置区 ==========
@@ -846,8 +854,118 @@ if len(features) >= 2:
         print(f"  [联合过滤] 移入背景 {len(combined_filtered)} 个 (dominant反向+高并发): "
               f"{sorted(combined_filtered, key=lambda x:int(x))}")
 
-    print(f"  MAIN RIDERS ({len(main_tids_set)}): {sorted(main_tids_set, key=lambda x:int(x))}")
-    print(f"  BACKGROUND  ({len(bg_tids_set)}):  {sorted(bg_tids_set,  key=lambda x:int(x))}")
+    print(f"  [K-means] MAIN RIDERS ({len(main_tids_set)}): {sorted(main_tids_set, key=lambda x:int(x))}")
+    print(f"  [K-means] BACKGROUND  ({len(bg_tids_set)}):  {sorted(bg_tids_set,  key=lambda x:int(x))}")
+
+    # ── ML 分类器 ──────────────────────────────────────────────────────
+    # 用 GBT 分类器替代/增强 K-means + 规则救援
+    # 冷启动（无模型）→ 保留 K-means 结果并生成标签模板
+    # 有模型 → GBT predict_proba → P>0.5 为主滑手
+    from track_classifier import (
+        compute_all_features, TrackClassifier,
+        bootstrap_labels_from_kmeans, save_labels, load_labels,
+        save_label_template, train_from_label_files,
+    )
+
+    # 计算主组质心（Re-ID 特征均值）
+    main_feats = [combined_feat_by_tid[t] for t in main_tids_set
+                  if t in combined_feat_by_tid]
+    main_centroid = np.mean(main_feats, axis=0) if main_feats else None
+
+    # 提取全部 track 的 20 维特征
+    all_classify_tids = list(set(list(main_tids_set) + list(bg_tids_set)))
+    features_by_tid = compute_all_features(
+        all_classify_tids,
+        W=W, H=H, fps=fps,
+        track_positions=track_positions,
+        track_segments=track_segments,
+        track_net_vx=track_net_vx,
+        track_signed_speed=track_signed_speed,
+        track_dominant_dir=track_dominant_dir,
+        per_track_h=per_track_h,
+        per_track_dark=per_track_dark,
+        track_hit_entry=track_hit_entry,
+        track_hit_exit=track_hit_exit,
+        track_max_concurrent=track_max_concurrent,
+        combined_feat_by_tid=combined_feat_by_tid,
+        main_tids_set=main_tids_set,
+        main_centroid=main_centroid,
+        track_crops=track_crops,
+    )
+    print(f"  [ML] 特征提取完成: {len(features_by_tid)} tracks × 20 features")
+
+    ml_used = False
+    if not args.no_ml:
+        # 尝试加载已有模型
+        classifier = TrackClassifier.load(MODEL_PATH)
+
+        # 如果有用户修正标签 → 重新训练
+        if args.labels and os.path.exists(args.labels):
+            # 复制用户标签到 labels 目录
+            import shutil
+            os.makedirs(LABELS_DIR, exist_ok=True)
+            dest = os.path.join(LABELS_DIR, os.path.basename(args.labels))
+            if os.path.abspath(args.labels) != os.path.abspath(dest):
+                shutil.copy2(args.labels, dest)
+            print(f"  [ML] 加载用户标签: {args.labels}")
+
+        # 尝试从 labels 目录聚合训练
+        if os.path.isdir(LABELS_DIR):
+            trained = train_from_label_files(LABELS_DIR)
+            if trained is not None:
+                classifier = trained
+                classifier.save(MODEL_PATH)
+                print(f"  [ML] 模型已保存: {MODEL_PATH}")
+
+        # 用分类器预测
+        if classifier is not None:
+            proba = classifier.predict_proba(features_by_tid)
+            ml_main = {tid for tid, p in proba.items() if p > 0.5}
+            ml_bg = {tid for tid in all_classify_tids if tid not in ml_main}
+
+            # 方向安全网：dominant_dir 反向 + 高并发 → 强制背景
+            if main_dir != 0:
+                for tid in list(ml_main):
+                    dom = track_dominant_dir.get(tid, 0)
+                    if dom != 0 and dom != main_dir and track_max_concurrent.get(tid, 0) > MAX_CONCURRENT:
+                        ml_main.discard(tid)
+                        ml_bg.add(tid)
+
+            print(f"  [ML] 分类器预测:")
+            print(f"    MAIN ({len(ml_main)}): {sorted(ml_main, key=lambda x:int(x))}")
+            print(f"    BG   ({len(ml_bg)}):   {sorted(ml_bg, key=lambda x:int(x))}")
+
+            # 显示 K-means vs ML 的差异
+            km_only = main_tids_set - ml_main
+            ml_only = ml_main - main_tids_set
+            if km_only:
+                print(f"    K-means→main, ML→bg: {sorted(km_only, key=lambda x:int(x))}")
+            if ml_only:
+                print(f"    K-means→bg, ML→main: {sorted(ml_only, key=lambda x:int(x))}")
+
+            main_tids_set = ml_main
+            bg_tids_set = ml_bg
+            ml_used = True
+        else:
+            print(f"  [ML] 无可用模型，使用 K-means 结果 (冷启动)")
+
+    # 生成/保存标签（无论是否使用 ML）
+    os.makedirs(LABELS_DIR, exist_ok=True)
+    kmeans_labels = bootstrap_labels_from_kmeans(
+        main_tids_set, bg_drag_tids_set, bg_same_tids_set,
+        ghost_tids, unstable_tids,
+    )
+    labels_path = os.path.join(LABELS_DIR, f"{_stem}_labels.json")
+    save_labels(kmeans_labels, features_by_tid, labels_path)
+    print(f"  [ML] 标签已保存: {labels_path}")
+
+    # 生成用户可编辑模板
+    save_label_template(all_classify_tids, main_tids_set, features_by_tid,
+                        LABEL_TMPL_PATH)
+    print(f"  [ML] 标签模板已生成: {LABEL_TMPL_PATH}")
+
+    print(f"  FINAL MAIN RIDERS ({len(main_tids_set)}): {sorted(main_tids_set, key=lambda x:int(x))}")
+    print(f"  FINAL BACKGROUND  ({len(bg_tids_set)}):  {sorted(bg_tids_set,  key=lambda x:int(x))}")
 
     # Step5：用结果覆盖cluster_map（main_cluster=2保持不变作为标记）
     main_cluster = 2

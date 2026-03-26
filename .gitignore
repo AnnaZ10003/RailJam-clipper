@@ -5,3 +5,6 @@ videos/
 *.pyc
 __pycache__/
 .claude/
+models/*.joblib
+models/labels/
+models/training_log.json
